@@ -1,0 +1,167 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    function signedIn() {
+      return request.auth != null;
+    }
+    function acceptedRequest(requestId, members) {
+      let requestPath = /databases/$(database)/documents/friendRequests/$(requestId);
+      return exists(requestPath)
+        && get(requestPath).data.status == "accepted"
+        && get(requestPath).data.senderUid in members
+        && get(requestPath).data.recipientUid in members;
+    }
+    function isFriend(userId) {
+      return signedIn() && (
+        exists(/databases/$(database)/documents/friendships/$(userId + "_" + request.auth.uid))
+        || exists(/databases/$(database)/documents/friendships/$(request.auth.uid + "_" + userId))
+      );
+    }
+
+    match /profiles/{userId} {
+      allow read, write: if signedIn() && request.auth.uid == userId;
+    }
+
+    // Friend-code documents contain only a UID and display name, never an email.
+    match /friendCodes/{code} {
+      allow get: if signedIn();
+      allow list: if false;
+      allow create: if signedIn()
+        && request.resource.data.uid == request.auth.uid
+        && request.resource.data.keys().hasOnly(["uid", "displayName"]);
+      allow update: if signedIn()
+        && resource.data.uid == request.auth.uid
+        && request.resource.data.uid == request.auth.uid
+        && request.resource.data.keys().hasOnly(["uid", "displayName"]);
+      allow delete: if false;
+    }
+
+    match /friendRequests/{requestId} {
+      allow get, list: if signedIn()
+        && (resource.data.senderUid == request.auth.uid || resource.data.recipientUid == request.auth.uid);
+      allow create: if signedIn()
+        && request.resource.data.senderUid == request.auth.uid
+        && request.resource.data.recipientUid != request.auth.uid
+        && exists(/databases/$(database)/documents/friendCodes/$(request.resource.data.recipientCode))
+        && get(/databases/$(database)/documents/friendCodes/$(request.resource.data.recipientCode)).data.uid == request.resource.data.recipientUid
+        && request.resource.data.status == "pending"
+        && requestId == request.auth.uid + "_" + request.resource.data.recipientUid
+        && request.resource.data.keys().hasOnly([
+          "senderUid", "recipientUid", "recipientCode", "senderName", "recipientName", "status", "createdAt"
+        ]);
+      allow update: if signedIn() && (
+        (resource.data.recipientUid == request.auth.uid
+          && resource.data.status == "pending"
+          && request.resource.data.status in ["accepted", "declined"]
+          && request.resource.data.diff(resource.data).affectedKeys().hasOnly(["status", "updatedAt"]))
+        ||
+        (resource.data.senderUid == request.auth.uid
+          && resource.data.status == "declined"
+          && request.resource.data.status == "pending"
+          && request.resource.data.diff(resource.data).affectedKeys().hasOnly(["status", "createdAt"]))
+      );
+      allow delete: if signedIn() && resource.data.status == "accepted"
+        && (resource.data.senderUid == request.auth.uid || resource.data.recipientUid == request.auth.uid);
+    }
+
+    match /friendships/{friendshipId} {
+      allow get, list: if signedIn() && request.auth.uid in resource.data.memberUids;
+      allow create: if signedIn()
+        && request.auth.uid in request.resource.data.memberUids
+        && request.resource.data.memberUids.size() == 2
+        && (friendshipId == request.resource.data.memberUids[0] + "_" + request.resource.data.memberUids[1]
+          || friendshipId == request.resource.data.memberUids[1] + "_" + request.resource.data.memberUids[0])
+        && acceptedRequest(request.resource.data.requestId, request.resource.data.memberUids)
+        && request.resource.data.keys().hasOnly(["memberUids", "displayNames", "requestId", "createdAt"]);
+      allow update: if false;
+      allow delete: if signedIn() && request.auth.uid in resource.data.memberUids;
+    }
+
+
+    function isFamilyMember(familyId) {
+      return signedIn() && exists(/databases/$(database)/documents/families/$(familyId))
+        && request.auth.uid in get(/databases/$(database)/documents/families/$(familyId)).data.memberUids;
+    }
+    match /families/{familyId} {
+      allow get: if signedIn() && request.auth.uid in resource.data.memberUids;
+      allow list: if false;
+      allow create: if signedIn() && request.resource.data.ownerUid==request.auth.uid && request.resource.data.memberUids==[request.auth.uid]
+        && request.resource.data.keys().hasOnly(["ownerUid","familyName","memberUids","displayNames","createdAt"]);
+      allow update: if signedIn() && resource.data.ownerUid==request.auth.uid && request.resource.data.ownerUid==resource.data.ownerUid
+        && request.resource.data.memberUids.size()==resource.data.memberUids.size()+1 && request.resource.data.memberUids.hasAll(resource.data.memberUids)
+        && request.resource.data.keys().hasOnly(["ownerUid","familyName","memberUids","displayNames","createdAt","updatedAt"]);
+      allow delete: if signedIn() && resource.data.ownerUid==request.auth.uid;
+    }
+    match /familyInvites/{token} {
+      allow get: if signedIn(); allow list: if false;
+      allow create: if signedIn() && request.resource.data.ownerUid==request.auth.uid && request.resource.data.familyId==request.auth.uid
+        && request.resource.data.expiresAt is int && request.resource.data.keys().hasOnly(["familyId","ownerUid","ownerName","expiresAt","createdAt"]);
+      allow update,delete: if signedIn() && resource.data.ownerUid==request.auth.uid;
+    }
+    match /familyJoinRequests/{requestId} {
+      allow get: if signedIn() && (resource.data.requesterUid==request.auth.uid || (exists(/databases/$(database)/documents/families/$(resource.data.familyId)) && get(/databases/$(database)/documents/families/$(resource.data.familyId)).data.ownerUid==request.auth.uid));
+      allow list: if signedIn() && (resource.data.requesterUid==request.auth.uid || (exists(/databases/$(database)/documents/families/$(resource.data.familyId)) && get(/databases/$(database)/documents/families/$(resource.data.familyId)).data.ownerUid==request.auth.uid));
+      allow create: if signedIn() && request.resource.data.requesterUid==request.auth.uid && request.resource.data.status=="pending"
+        && exists(/databases/$(database)/documents/familyInvites/$(request.resource.data.inviteToken))
+        && get(/databases/$(database)/documents/familyInvites/$(request.resource.data.inviteToken)).data.familyId==request.resource.data.familyId
+        && get(/databases/$(database)/documents/familyInvites/$(request.resource.data.inviteToken)).data.ownerUid==request.resource.data.ownerUid
+        && get(/databases/$(database)/documents/familyInvites/$(request.resource.data.inviteToken)).data.expiresAt>request.time.toMillis()
+        && request.resource.data.keys().hasOnly(["familyId","inviteToken","ownerUid","requesterUid","requesterName","status","createdAt"]);
+      allow update: if signedIn() && resource.data.ownerUid==request.auth.uid && resource.data.status=="pending"
+        && request.resource.data.status in ["accepted","declined"] && request.resource.data.diff(resource.data).affectedKeys().hasOnly(["status","updatedAt"]);
+      allow delete: if false;
+    }
+    match /familyUsage/{usageId} {
+      allow get,list: if signedIn() && isFamilyMember(resource.data.familyId);
+      allow create,update: if signedIn() && request.resource.data.uid==request.auth.uid && isFamilyMember(request.resource.data.familyId)
+        && request.resource.data.litres is number && request.resource.data.litres>=0
+        && request.resource.data.keys().hasOnly(["familyId","uid","displayName","date","litres","updatedAt"]);
+      allow delete: if signedIn() && resource.data.uid==request.auth.uid;
+    }
+    match /communityDaily/{date} {
+      // Only date-level counts in broad usage bands are shared; no user IDs or exact readings.
+      allow get: if signedIn();
+      allow list: if false;
+      allow create, update: if signedIn()
+        && request.resource.data.keys().hasOnly(["date", "bucketCounts", "updatedAt"])
+        && request.resource.data.date == date
+        && request.resource.data.bucketCounts is map
+        && request.resource.data.bucketCounts.keys().hasOnly([
+          "b0", "b1", "b2", "b3", "b4", "b5", "b6", "b7", "b8", "b9", "b10"
+        ])
+        && request.resource.data.bucketCounts.b0 is int && request.resource.data.bucketCounts.b0 >= 0
+        && request.resource.data.bucketCounts.b1 is int && request.resource.data.bucketCounts.b1 >= 0
+        && request.resource.data.bucketCounts.b2 is int && request.resource.data.bucketCounts.b2 >= 0
+        && request.resource.data.bucketCounts.b3 is int && request.resource.data.bucketCounts.b3 >= 0
+        && request.resource.data.bucketCounts.b4 is int && request.resource.data.bucketCounts.b4 >= 0
+        && request.resource.data.bucketCounts.b5 is int && request.resource.data.bucketCounts.b5 >= 0
+        && request.resource.data.bucketCounts.b6 is int && request.resource.data.bucketCounts.b6 >= 0
+        && request.resource.data.bucketCounts.b7 is int && request.resource.data.bucketCounts.b7 >= 0
+        && request.resource.data.bucketCounts.b8 is int && request.resource.data.bucketCounts.b8 >= 0
+        && request.resource.data.bucketCounts.b9 is int && request.resource.data.bucketCounts.b9 >= 0
+        && request.resource.data.bucketCounts.b10 is int && request.resource.data.bucketCounts.b10 >= 0
+        && request.resource.data.updatedAt is string;
+      allow delete: if false;
+    }
+
+    match /friendStats/{userId} {
+      allow get: if signedIn() && (request.auth.uid == userId || isFriend(userId));
+      allow list: if false;
+      allow create, update: if signedIn()
+        && request.auth.uid == userId
+        && request.resource.data.keys().hasOnly([
+          "displayName", "date", "dailyUsed", "dailyGoal", "litresSaved", "leaderboardVisible"
+        ])
+        && request.resource.data.displayName is string
+        && request.resource.data.date is string
+        && request.resource.data.dailyUsed is number
+        && request.resource.data.dailyUsed >= 0
+        && request.resource.data.dailyGoal is number
+        && request.resource.data.dailyGoal > 0
+        && request.resource.data.litresSaved is number
+        && request.resource.data.litresSaved >= 0
+        && request.resource.data.leaderboardVisible is bool;
+      allow delete: if signedIn() && request.auth.uid == userId;
+    }
+  }
+}
